@@ -1,0 +1,153 @@
+version: "3"
+
+x-common-environment: &common-environment
+  AWS_ACCESS_KEY_ID: admin
+  AWS_SECRET_ACCESS_KEY: password
+  AWS_REGION: us-east-1
+
+services:
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      iceberg_net:
+    depends_on:
+      - rest
+      - minio
+    ports:
+      - 8080:8080
+    volumes:
+      - ./trino/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      - ./trino/test-schema.sql:/home/trino/test-schema.sql
+    environment:
+      <<: *common-environment
+
+  rest:
+    image: tabulario/iceberg-rest
+    container_name: iceberg-rest
+    networks:
+      iceberg_net:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - 8181:8181
+    environment:
+      <<: *common-environment
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_URI: jdbc:postgresql://postgres/demo_catalog
+      CATALOG_JDBC_USER: admin
+      CATALOG_JDBC_PASSWORD: password
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: demo_catalog
+      POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - 5430:5432
+    networks:
+      iceberg_net:
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d demo_catalog"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    volumes:
+      - minio_data:/data
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      iceberg_net:
+    environment:
+      <<: *common-environment
+    entrypoint: >
+      /bin/sh -c "
+          until (/usr/bin/mc config host add minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+          /usr/bin/mc mb minio/warehouse;
+          /usr/bin/mc policy set public minio/warehouse;
+          tail -f /dev/null
+      "      
+
+  jobmanager:
+    image: flink:1.18.0
+    container_name: jobmanager
+    environment:
+      <<: *common-environment
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+    ports:
+      - "8081:8081"
+    networks:
+      iceberg_net:
+    command: jobmanager.sh start-foreground
+    volumes:
+      - ./jars/flink-connector-jdbc-3.1.0-1.17.jar:/opt/flink/lib/flink-connector-jdbc-3.1.0-1.17.jar
+      - ./jars/flink-shaded-hadoop-2-uber-2.8.3-10.0.jar:/opt/flink/lib/flink-shaded-hadoop-2-uber-2.8.3-10.0.jar
+      - ./jars/flink-s3-fs-hadoop-1.17.1.jar:/opt/flink/lib/flink-s3-fs-hadoop-1.17.1.jar
+      - ./jars/iceberg-flink-runtime-1.18-1.5.2.jar:/opt/flink/lib/iceberg-flink-runtime-1.18-1.5.2.jar
+      - ./jars/hadoop-mapreduce-client-core-3.3.4.jar:/opt/flink/lib/hadoop-mapreduce-client-core-3-3.4.jar
+      - ./jars/hadoop-hdfs-client-3.2.1.jar:/opt/flink/lib/hadoop-hdfs-client-3.2.1.jar
+      - ./jars/hadoop-aws-3.3.4.jar:/opt/flink/lib/hadoop-aws-3.3.4.jar
+      - ./jars/bundle-2.20.18.jar:/opt/flink/lib/bundle-2.20.18.jar
+      - ./jobs/job.sql:/opt/flink/job.sql
+      - ./flink/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml
+    deploy:
+          replicas: 1
+  taskmanager:
+    image: flink:1.18.0
+    networks:
+      iceberg_net:
+    environment:
+      <<: *common-environment
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+    depends_on:
+      - jobmanager
+    command: taskmanager.sh start-foreground
+    volumes:
+      - ./jars/flink-sql-connector-mysql-cdc-2.4.1.jar:/opt/flink/lib/flink-sql-connector-mysql-cdc-2.4.1.jar
+      - ./jars/flink-connector-jdbc-3.1.0-1.17.jar:/opt/flink/lib/flink-connector-jdbc-3.1.0-1.17.jar
+      - ./jars/flink-shaded-hadoop-2-uber-2.8.3-10.0.jar:/opt/flink/lib/flink-shaded-hadoop-2-uber-2.8.3-10.0.jar
+      - ./jars/flink-s3-fs-hadoop-1.17.1.jar:/opt/flink/lib/flink-s3-fs-hadoop-1.17.1.jar
+      - ./jars/iceberg-flink-runtime-1.18-1.5.2.jar:/opt/flink/lib/iceberg-flink-runtime-1.18-1.5.2.jar
+      - ./jars/hadoop-mapreduce-client-core-3.3.4.jar:/opt/flink/lib/hadoop-mapreduce-client-core-3-3.4.jar
+      - ./jars/hadoop-hdfs-client-3.2.1.jar:/opt/flink/lib/hadoop-hdfs-client-3.2.1.jar
+      - ./jars/hadoop-aws-3.3.4.jar:/opt/flink/lib/hadoop-aws-3.3.4.jar
+      - ./jars/bundle-2.20.18.jar:/opt/flink/lib/bundle-2.20.18.jar
+      - ./flink/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml
+      - ./flink/core-site.xml:/opt/hadoop/conf/core-site.xml
+    deploy:
+          replicas: 1
+networks:
+  iceberg_net:
+
+volumes:
+  postgres_data:
+  minio_data:
